@@ -6,7 +6,12 @@
 version: 2
 updates:
   - package-ecosystem: "nuget" # See documentation for possible values
-    directory: "Source/" # Location of package manifests
+    directory: "Source/SmartHotel360.Website/" # Location of package manifests
+    open-pull-requests-limit: 100
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "nuget" # See documentation for possible values
+    directory: "Source/SmartHotel360.WebsiteFunction/" # Location of package manifests
     open-pull-requests-limit: 100
     schedule:
       interval: "weekly"
