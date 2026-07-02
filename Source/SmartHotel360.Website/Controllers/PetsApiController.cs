@@ -1,6 +1,5 @@
 ﻿using Microsoft.AspNetCore.Mvc;
-using Microsoft.Azure.Documents;
-using Microsoft.Azure.Documents.Client;
+using Microsoft.Azure.Cosmos;
 using Microsoft.Extensions.Options;
 using SmartHotel360.PublicWeb.Models.Settings;
 using SmartHotel360.PublicWeb.Services;
@@ -58,15 +57,13 @@ namespace SmartHotel360.PublicWeb.Controllers
 
             var endpoint = new Uri(_settings.PetsConfig.CosmosUri);
             var auth = _settings.PetsConfig.CosmosKey;
-            var client = new DocumentClient(endpoint, auth);
+            using var client = new CosmosClient(endpoint.ToString(), auth);
             var identifier = Guid.NewGuid();
 
-            await client.CreateDatabaseIfNotExistsAsync(new Database() { Id = dbName });
-            await client.CreateDocumentCollectionIfNotExistsAsync(UriFactory.CreateDatabaseUri(dbName),
-                new DocumentCollection { Id = colName });
+            await client.CreateDatabaseIfNotExistsAsync(dbName);
+            var container = client.GetContainer(dbName, colName);
 
-            await client.CreateDocumentAsync(
-                UriFactory.CreateDocumentCollectionUri(dbName, colName),
+            await container.UpsertItemAsync(
                 new PetDocument
                 {
                     Id = identifier,
@@ -74,7 +71,7 @@ namespace SmartHotel360.PublicWeb.Controllers
                     PetName = petName,
                     MediaUrl = uri.ToString(),
                     Created = DateTime.UtcNow
-                });
+                }, PartitionKey.None);
 
             return identifier;
         }
@@ -94,12 +91,21 @@ namespace SmartHotel360.PublicWeb.Controllers
 
             var endpoint = new Uri(_settings.PetsConfig.CosmosUri);
             var auth = _settings.PetsConfig.CosmosKey;
-            var client = new DocumentClient(endpoint, auth);
+            using var client = new CosmosClient(endpoint.ToString(), auth);
 
-            var collectionUri = UriFactory.CreateDocumentCollectionUri(dbName, colName);
-            var query = client.CreateDocumentQuery<PetDocument>(collectionUri, new FeedOptions() { MaxItemCount = 1 });
+            var container = client.GetContainer(dbName, colName);
+            var queryDefinition = new QueryDefinition("SELECT * FROM c WHERE c.id = @id AND IS_DEFINED(c.IsApproved)")
+                .WithParameter("@id", identifier.ToString());
+            var query = container.GetItemQueryIterator<PetDocument>(
+                queryDefinition,
+                requestOptions: new QueryRequestOptions { MaxItemCount = 1, PartitionKey = PartitionKey.None });
 
-            var docs = query.Where(x => x.Id == identifier).Where(x => x.IsApproved.HasValue).ToList();
+            var docs = new List<PetDocument>();
+            while (query.HasMoreResults)
+            {
+                var response = query.ReadNextAsync().GetAwaiter().GetResult();
+                docs.AddRange(response);
+            }
 
             var doc = docs.FirstOrDefault();
 

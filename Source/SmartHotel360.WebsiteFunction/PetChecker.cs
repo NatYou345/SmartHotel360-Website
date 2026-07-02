@@ -1,112 +1,105 @@
-using Microsoft.AspNetCore.Mvc;
-using Microsoft.Azure.Documents;
-using Microsoft.Azure.Documents.Client;
-using Microsoft.Azure.WebJobs;
-using Microsoft.Azure.WebJobs.Extensions.Http;
-using Microsoft.Azure.WebJobs.Extensions.SignalRService;
-using Microsoft.Azure.WebJobs.Host;
+using Microsoft.Azure.Cosmos;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.ProjectOxford.Vision;
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Net;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 
 
 namespace PetCheckerFunction
 {
     public static class PetChecker
     {
-        [FunctionName("PetChecker")]
-        public static async Task RunPetChecker(
-            [CosmosDBTrigger("pets", "checks", ConnectionStringSetting = "constr",
-            CreateLeaseCollectionIfNotExists=true)] IReadOnlyList<Document> document,
-            [SignalR(HubName = "petcheckin", ConnectionStringSetting = "AzureSignalRConnectionString")] IAsyncCollector<SignalRMessage> sender,
-            TraceWriter log)
+        [Function("PetChecker")]
+        [SignalROutput(HubName = "petcheckin", ConnectionStringSetting = "AzureSignalRConnectionString")]
+        public static async Task<SignalRMessageAction?> RunPetChecker(
+            [CosmosDBTrigger(
+                databaseName: "pets",
+                containerName: "checks",
+                Connection = "constr",
+                LeaseContainerName = "leases",
+                CreateLeaseContainerIfNotExists = true)] PetDocument document,
+            FunctionContext context)
         {
-            var sendingResponse = false;
+            var log = context.GetLogger(nameof(PetChecker));
+
             try
             {
-                foreach (dynamic doc in document)
+                if (document.IsApproved.HasValue)
                 {
-                    sendingResponse = false;
-                    var isProcessed = doc.IsApproved != null;
-                    if (isProcessed)
-                    {
-                        continue;
-                    }
-
-                    var url = doc.MediaUrl.ToString();
-                    var uploaded = (DateTime)doc.Created;
-                    log.Info($">>> Processing image in {url} upladed at {uploaded.ToString()}");
-
-                    using (var httpClient = new HttpClient())
-                    {
-                        
-                        var res = await httpClient.GetAsync(url);
-                        var stream = await res.Content.ReadAsStreamAsync() as Stream;
-                        log.Info($"--- Image succesfully downloaded from storage");
-                        var (allowed, message, tags) = await PassesImageModerationAsync(stream, log);
-                        log.Info($"--- Image analyzed. It was {(allowed ? string.Empty : "NOT")} approved");
-                        doc.IsApproved = allowed;
-                        doc.Message = message;
-                        log.Info($"--- Updating CosmosDb document to have historical data");
-                        await UpsertDocument(doc, log);
-                        log.Info("--- Sending SignalR response.");
-                        sendingResponse = true;
-                        await SendSignalRResponse(sender, allowed, message);
-                        log.Info($"<<< Done! Image in {url} processed!");
-                    }
+                    return null;
                 }
+
+                var url = document.MediaUrl;
+                var uploaded = document.Created;
+                log.LogInformation(">>> Processing image in {Url} uploaded at {Uploaded}", url, uploaded);
+
+                using var httpClient = new HttpClient();
+                using var res = await httpClient.GetAsync(url);
+                await using var stream = await res.Content.ReadAsStreamAsync();
+
+                log.LogInformation("--- Image successfully downloaded from storage");
+                var (allowed, message, tags) = await PassesImageModerationAsync(stream, log);
+                log.LogInformation("--- Image analyzed. It was {ApprovalState} approved", allowed ? string.Empty : "NOT");
+
+                document.IsApproved = allowed;
+                document.Message = message;
+                document.Analyzed = DateTime.UtcNow;
+
+                log.LogInformation("--- Updating Cosmos DB document to have historical data");
+                await UpsertDocument(document, log);
+                log.LogInformation("--- Sending SignalR response.");
+                log.LogInformation("--- Image tags: {Tags}", string.Join(",", tags));
+                log.LogInformation("<<< Done! Image in {Url} processed!", url);
+
+                return CreateSignalRResponse(allowed, message);
             }
             catch (Exception ex)
             {
                 var msg = $"Error {ex.Message} ({ex.GetType().Name})";
-                log.Info("!!! " + msg);
+                log.LogInformation("!!! {Message}", msg);
 
                 if (ex is AggregateException aggex)
                 {
                     foreach (var innex in aggex.InnerExceptions)
                     {
-                        log.Info($"!!! (inner) Error {innex.Message} ({innex.GetType().Name})");
+                        log.LogInformation("!!! (inner) Error {Message} ({Type})", innex.Message, innex.GetType().Name);
                     }
                 }
 
-                if (!sendingResponse)
-                {
-                    await SendSignalRResponse(sender, false, msg);
-                }
-                throw ex;
+                return CreateSignalRResponse(false, msg);
             }
         }
 
-        private static Task SendSignalRResponse(IAsyncCollector<SignalRMessage> sender, bool isOk, string message)
+        private static SignalRMessageAction CreateSignalRResponse(bool isOk, string message)
         {
-            return sender.AddAsync(new SignalRMessage()
+            return new SignalRMessageAction("ProcessDone")
             {
-                Target = "ProcessDone",
                 Arguments = new[] { new {
                     processedAt = DateTime.UtcNow,
                     accepted = isOk,
                     message
                 }}
-            });
-
+            };
         }
 
-        private static async Task UpsertDocument(dynamic doc, TraceWriter log)
+        private static async Task UpsertDocument(PetDocument doc, ILogger log)
         {
             var endpoint = await GetSecret("cosmos_uri");
             var auth = await GetSecret("cosmos_key");
 
-            var client = new DocumentClient(new Uri(endpoint), auth);
+            using var client = new CosmosClient(endpoint, auth);
             var dbName = "pets";
             var colName = "checks";
             doc.Analyzed = DateTime.UtcNow;
-            await client.UpsertDocumentAsync(
-                UriFactory.CreateDocumentCollectionUri(dbName, colName), doc);
-            log.Info($"--- CosmosDb document updated.");
+            var container = client.GetContainer(dbName, colName);
+            await container.UpsertItemAsync(doc, PartitionKey.None);
+            log.LogInformation("--- Cosmos DB document updated.");
         }
 
         private static async Task<string> GetSecret(string secretName)
@@ -115,11 +108,11 @@ namespace PetCheckerFunction
             return Environment.GetEnvironmentVariable(secretName);
         }
 
-        public static async Task<(bool allowd, string message, string[] tags)> PassesImageModerationAsync(Stream image, TraceWriter log)
+        public static async Task<(bool allowd, string message, string[] tags)> PassesImageModerationAsync(Stream image, ILogger log)
         {
             try
             {
-                log.Info("--- Creating VisionApi client and analyzing image");
+            log.LogInformation("--- Creating Vision API client and analyzing image");
 
                 var key = await GetSecret("MicrosoftVisionApiKey");
                 var endpoint = await GetSecret("MicrosoftVisionApiEndpoint");
@@ -128,7 +121,7 @@ namespace PetCheckerFunction
                 var features = new VisualFeature[] { VisualFeature.Description };
                 var result = await client.AnalyzeImageAsync(image, features);
 
-                log.Info($"--- Image analyzed with tags: {String.Join(",", result.Description.Tags)}");
+                log.LogInformation("--- Image analyzed with tags: {Tags}", string.Join(",", result.Description.Tags));
                 if (!int.TryParse(numTags, out var tagsToFetch))
                 {
                     tagsToFetch = 5;
@@ -140,19 +133,20 @@ namespace PetCheckerFunction
             }
             catch (Exception ex)
             {
-                log.Info("Vision API error! " + ex.Message);
+                log.LogInformation("Vision API error! {Message}", ex.Message);
                 return (false, "error " + ex.Message, new string[0]);
             }
         }
 
-        [FunctionName(nameof(SignalRInfo))]
-        public static IActionResult SignalRInfo(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "post")]HttpRequestMessage req,
-        [SignalRConnectionInfo(HubName = "petcheckin")] SignalRConnectionInfo info)
+        [Function(nameof(SignalRInfo))]
+        public static HttpResponseData SignalRInfo(
+            [HttpTrigger(AuthorizationLevel.Anonymous, "post")] HttpRequestData req,
+            [SignalRConnectionInfoInput(HubName = "petcheckin")] string connectionInfo)
         {
-            return info != null
-                ? (ActionResult)new OkObjectResult(info)
-                : new NotFoundObjectResult("Failed to load SignalR Info.");
+            var response = req.CreateResponse(HttpStatusCode.OK);
+            response.Headers.Add("Content-Type", "application/json; charset=utf-8");
+            response.WriteString(connectionInfo);
+            return response;
         }
 
     }

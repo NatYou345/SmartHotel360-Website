@@ -3,7 +3,6 @@ using Microsoft.AspNetCore.Mvc;
 using SmartHotel360.PublicWeb.Services;
 using SmartHotel360.PublicWeb.Models.Settings;
 using System;
-using Microsoft.ApplicationInsights;
 
 namespace SmartHotel360.PublicWeb.Controllers
 {
